@@ -35,14 +35,19 @@ def is_hub_id(run):
     return not os.path.isdir(run) and HUB_ID.fullmatch(str(run)) is not None
 
 
-def resolve_run(run):
+WEIGHT_FILES = ["*.safetensors"]
+META_FILES = ["*.json", "*.pt", "*.txt", "*.jinja"]   # head.pt, configs, tokenizer, an adapter's config, a full checkpoint's shard index
+
+
+def resolve_run(run, weights=True):
     """Local run directory as given, or a Hub repo id like jaredpalmer/kev-4b, optionally pinned to a revision or tag
-    with `@` (jaredpalmer/kev-4b@qwen3), downloaded to the HF cache. Returns a str path."""
+    with `@` (jaredpalmer/kev-4b@qwen3), downloaded to the HF cache. Returns a str path. weights=False fetches only the
+    metadata files (META_FILES): what a pipeline coordinator needs (kev.pipeline), whose backbone lives on its stages."""
     if os.path.isdir(run):
         return str(run)
     from huggingface_hub import snapshot_download
     repo, _, revision = str(run).partition("@")
-    return snapshot_download(repo, revision=revision or None, allow_patterns=["*.json", "*.safetensors", "*.pt", "*.txt", "*.jinja"])
+    return snapshot_download(repo, revision=revision or None, allow_patterns=META_FILES + (WEIGHT_FILES if weights else []))
 
 
 @dataclass
@@ -117,6 +122,13 @@ class LoadOptions:
     fused        rewrite a merged hybrid backbone on CUDA with fused Triton kernels (kev.fused_qwen35; needs
                  flash-linear-attention fused_qwen35.FLA_VERSION and refuses any other). None = off; kev.serve turns it on
                  for CUDA when fused_available() (KEV_FUSED=0 to decline). Equal to the reference layers up to bf16 rounding.
+    stages       the backbone's layers spread over several hosts (kev.pipeline): the URLs of the stage servers
+                 (`python -m kev.stage`), each holding a contiguous slice of the decoder layers, in any order. `load` then
+                 returns a PipelineDecisionModel: this process keeps only the tokenizer and the pointer head and runs every
+                 pass through the stages; `device` is where the head runs (cpu is fine). The stages decide dtype, attention
+                 implementation and (on a LoRA checkpoint) always merge the adapter, so dtype / merge / attn / cuda_graphs /
+                 fused do not apply; lora_scale does (each stage scales its own merge). stage_key: the bearer key the stage
+                 servers were started with (KEV_STAGE_KEY), if any.
     """
     dtype: torch.dtype | None = None
     merge: bool = True
@@ -126,13 +138,15 @@ class LoadOptions:
     backend: str | None = None
     cuda_graphs: bool | None = None
     fused: bool | None = None
+    stages: tuple = ()
+    stage_key: str | None = None
 
     BACKENDS = (None, "torch", "mlx", "auto")
 
     @classmethod
     def from_env(cls, env=os.environ):
         """KEV_DTYPE=bf16|fp16|fp32, KEV_MERGE=0, KEV_ATTN=sdpa|eager, KEV_LORA_SCALE, KEV_TEMPERATURE, KEV_BACKEND=torch|mlx|auto,
-        KEV_CUDA_GRAPHS=0|1, KEV_FUSED=0|1.
+        KEV_CUDA_GRAPHS=0|1, KEV_FUSED=0|1, KEV_STAGES=<url>,<url>,... (+ KEV_STAGE_KEY).
         For command-line entry points only; library code passes an explicit LoadOptions. Explicit values that equal a
         library default are kept (fp32 as torch.float32, "torch" as a string) so a caller with its own default, like
         kev.serve, can tell "asked for it" from "did not say"."""
@@ -143,7 +157,9 @@ class LoadOptions:
                    lora_scale=float(env.get("KEV_LORA_SCALE", "1")),
                    temperature=float(env["KEV_TEMPERATURE"]) if env.get("KEV_TEMPERATURE") else None, backend=backend,
                    cuda_graphs={"0": False, "1": True}.get(env.get("KEV_CUDA_GRAPHS", "")),
-                   fused={"0": False, "1": True}.get(env.get("KEV_FUSED", "")))
+                   fused={"0": False, "1": True}.get(env.get("KEV_FUSED", "")),
+                   stages=tuple(s.strip() for s in env.get("KEV_STAGES", "").split(",") if s.strip()),
+                   stage_key=env.get("KEV_STAGE_KEY") or None)
 
 
 def mlx_available():
@@ -167,9 +183,13 @@ def fused_available():
 
 
 class Checkpoint:
-    def __init__(self, run):
+    def __init__(self, run, weights=True):
+        """weights=False resolves a Hub checkpoint without its safetensors (resolve_run): for a pipeline coordinator, which
+        loads no backbone (LoadOptions.stages). Such a Checkpoint can tell its layout, read its meta and config and build
+        the pipeline model; loading the backbone itself, or hashing its weights, needs the files."""
         self.requested = str(run)                    # what the caller asked for (a Hub id stays a Hub id in labels)
-        self.path = resolve_run(run)
+        self.path = resolve_run(run, weights=weights)
+        self.weights_resolved = weights
         self.meta = read_meta(self.path)
 
     def file(self, name):
@@ -181,8 +201,8 @@ class Checkpoint:
     @property
     def full(self):
         """The loader rule (module docstring): True for a full-weight checkpoint, False for a LoRA adapter; head.pt's
-        `weights` must agree with the files."""
-        found = "lora" if self.file("adapter_config.json").exists() else "full" if self.file("config.json").exists() and self.shards() else None
+        `weights` must agree with the files (without the weight files resolved, with config.json alone)."""
+        found = "lora" if self.file("adapter_config.json").exists() else "full" if self.file("config.json").exists() and (self.shards() or not self.weights_resolved) else None
         if found != self.meta.weights:
             raise ValueError(f"{self.path}: head.pt says weights={self.meta.weights!r} but the directory holds "
                              f"{ {'lora': 'an adapter', 'full': 'backbone weights'}.get(found, 'neither an adapter nor backbone weights') }")
@@ -216,12 +236,22 @@ class Checkpoint:
         stamp = next((t for t in [self.file("head.pt").stat().st_mtime, *files] if t >= MTIME_FLOOR), None)
         return "unknown" if stamp is None else datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc).date().isoformat()
 
-    def hybrid_base(self):
-        """Whether the backbone has Gated DeltaNet layers (Qwen3.5), read from a config without loading weights: the base's
-        for a LoRA adapter, the checkpoint's own config.json for full weights (the backbone that is actually loaded)."""
+    def text_config(self):
+        """The text backbone's config, read without loading weights: the base's for a LoRA adapter, the checkpoint's own
+        config.json for full weights (the backbone that is actually loaded)."""
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(self.path) if self.full else AutoConfig.from_pretrained(self.meta.base, revision=self.meta.base_revision)
-        return is_hybrid(config.get_text_config())
+        return config.get_text_config()
+
+    def hybrid_base(self):
+        """Whether the backbone has Gated DeltaNet layers (Qwen3.5)."""
+        return is_hybrid(self.text_config())
+
+    def weights_source(self):
+        """Where the backbone's shards come from, as something resolve_run takes: the checkpoint itself for full weights,
+        `base@revision` for a LoRA adapter (kev.stage fetches only the shards its layers need from it)."""
+        if self.full or os.path.isdir(self.meta.base): return self.path if self.full else self.meta.base
+        return f"{self.meta.base}@{self.meta.base_revision or ''}"
 
     def backend(self, device, opts=LoadOptions()):
         """The backend `load` will use: LoadOptions.backend resolved ("auto" -> mlx only where it pays and is installed)."""
@@ -236,10 +266,34 @@ class Checkpoint:
         meta = self.meta
         if self.full and opts.lora_scale != 1: raise ValueError("lora_scale interpolates an adapter; a full-weight checkpoint has none")
         tok = load_tokenizer(meta.base, revision=meta.base_revision)
-        m = self._load_mlx(tok, opts) if self.backend(device, opts) == "mlx" else self._load_torch(tok, device, opts)
+        if opts.stages: m = self._load_pipeline(tok, device, opts)
+        elif not self.weights_resolved: raise ValueError(f"{self.requested} was resolved without its weights (Checkpoint(weights=False)); only a pipeline (LoadOptions.stages) can load it")
+        else: m = self._load_mlx(tok, opts) if self.backend(device, opts) == "mlx" else self._load_torch(tok, device, opts)
         m.head.load_state_dict(meta.head); m.eval()
         m.head.temperature = meta.temperature if opts.temperature is None else opts.temperature
         return tok, m
+
+    def _load_pipeline(self, tok, device, opts):
+        """-> PipelineDecisionModel over the stage servers opts.stages (kev.pipeline.connect checks that they tile this
+        checkpoint's layers and serve this very checkpoint). The head runs on `device`."""
+        from .pipeline import PipelineDecisionModel, connect
+        if self.meta.special_embeddings: raise ValueError("a pipeline does not carry trained token embeddings (special_embeddings checkpoints); use one host")
+        config = self.text_config()
+        stages = connect(opts.stages, config, self.fingerprint(), key=opts.stage_key, lora_scale=opts.lora_scale)
+        return PipelineDecisionModel(stages, config, pad_id(tok), device, head_dim=self.meta.head_dim, option_isolation=self.meta.option_isolation)
+
+    def fingerprint(self):
+        """What identifies this checkpoint to a pipeline without its weight files: head.pt's sha256 (the pointer head, the
+        meta, the temperature and its fit, the training record) and, with the files resolved, the adapter's sha256 or a
+        full checkpoint's shard index (its single shard when there is no index). A stage reports the same dict."""
+        from .suite import digest   # lazy: the Space vendors this module without kev/suite.py
+        out = {"head": digest(self.file("head.pt")), "weights": None}
+        if not self.full and self.file("adapter_model.safetensors").exists(): out["weights"] = digest(self.file("adapter_model.safetensors"))
+        if self.full:
+            index = self.file("model.safetensors.index.json")
+            if index.exists(): out["weights"] = digest(index)
+            elif self.shards(): out["weights"] = digest(self.shards()[0])
+        return out
 
     def _load_mlx(self, tok, opts):
         """-> MLXDecisionModel. A LoRA checkpoint: the base's mlx-lm model with the adapter merged (fp32, one rounding). A

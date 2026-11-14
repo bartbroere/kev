@@ -80,6 +80,7 @@ def kernel_environment(model, device):
            "gpu": torch.cuda.get_device_name(torch.device(device)) if str(device).startswith("cuda") else None,
            "backend": model.backend, "dtype": model.dtype, "triton_f32_default": os.environ.get("TRITON_F32_DEFAULT"),
            "attention": None, "deltanet": None}
+    if model.backend == "pipeline": env["stages"] = model.stages_info()   # kev.pipeline: each stage's device, dtype and attention; their kernels are theirs
     if model.backend != "torch": return env   # kev.mlx_model: mlx-lm's Metal kernels, named by the mlx / mlx-lm versions
     env["attention"] = getattr(model.lm.config, "_attn_implementation", None)
     layer = next((m for m in model.lm.modules() if type(m).__name__.endswith("GatedDeltaNet")), None) if model.hybrid else None
@@ -135,7 +136,7 @@ class LocalPredictor:
         torch_backend = self.model.backend == "torch"
         efficient = long and torch_backend and self.device == "cuda"
         with long_row_kernels() if efficient else contextlib.nullcontext():
-            if long and torch_backend and self.model.hybrid: logits = self.model.forward_batch([enc], shared_prefix=True)[0]
+            if long and self.model.backend in ("torch", "pipeline") and self.model.hybrid: logits = self.model.forward_batch([enc], shared_prefix=True)[0]
             else: logits = self.model.forward(enc)
         ps = [torch.softmax(z, -1).cpu() for z in logits]
         zs = [z.float().cpu() for z in logits]

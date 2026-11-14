@@ -135,6 +135,22 @@ Example response from Kev-4B, running in bf16 on an Apple M5:
 
 The ticket mentions a return, a late delivery and a billing problem, and the department probabilities say so. That's why Kev returns probabilities instead of a single label: your code can route the confident cases and send the rest to a person.
 
+### Spread It Over Several Machines
+
+If no single machine you have fits a checkpoint (Kev-27B wants about 66 GB when serving), you can cut its layers across hosts. Each host runs one stage, a contiguous slice of the decoder layers, and downloads only the shards those layers need:
+
+```bash
+# host a, host b, host c (the slices must tile the 64 layers; --stage i --of 3 cuts them equally)
+KEV_STAGE_KEY=<shared secret> uv run --extra serve python -m kev.stage --run jaredpalmer/kev-27b --layers 0:22  --host 0.0.0.0 --port 9100
+KEV_STAGE_KEY=<shared secret> uv run --extra serve python -m kev.stage --run jaredpalmer/kev-27b --layers 22:43 --host 0.0.0.0 --port 9100
+KEV_STAGE_KEY=<shared secret> uv run --extra serve python -m kev.stage --run jaredpalmer/kev-27b --layers 43:64 --host 0.0.0.0 --port 9100
+# anywhere, even a laptop: the coordinator holds only the tokenizer and the pointer head
+KEV_STAGE_KEY=<shared secret> KEV_STAGES=http://a:9100,http://b:9100,http://c:9100 \
+  uv run --extra serve python -m kev.serve --run jaredpalmer/kev-27b --port 8009
+```
+
+The API is unchanged, and so are the answers: a request runs the same layers in the same order with the same per-layer caches, only the hidden states travel between hosts (in the model's own dtype, about 10 KB per token for Kev-27B). The state-prefix cache works as before, with each stage keeping the cache of its own layers. What you pay is the network: every pass crosses each host twice, so a pipeline is for a model that does not fit, not for speed. Put the stages on a private network or behind TLS, because the hidden states of your documents cross it, and set `KEV_STAGE_KEY` so only your coordinator can drive them. `kev.benchmark` reads through the same `KEV_STAGES`.
+
 ### Use It From Python
 
 If you already call Jev, point your client at Kev and keep the rest of your code. The TypeSafe SDK is included in `uv sync --extra serve`:

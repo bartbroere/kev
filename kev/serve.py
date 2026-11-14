@@ -9,7 +9,9 @@ comparison). KEV_PREFIX_CACHE / KEV_PREFIX_MIN_TOKENS / KEV_PREFIX_MAX_TOKENS si
 date preprocessing (api.with_date_facts). A state over kev.model.SERVE_MAX_STATE tokens is refused with a 422 (kev.model.admit);
 KEV_TRUNCATE_STATES=1 reads its first SERVE_MAX_STATE tokens instead, and then every response says whether it did. Backend
 and precision follow LoadOptions (KEV_BACKEND, KEV_DTYPE, ...): on Apple Silicon a hybrid checkpoint runs on MLX
-by default, without a torch MPS probe, elsewhere on torch in bf16.
+by default, without a torch MPS probe, elsewhere on torch in bf16. KEV_STAGES=<url>,<url>,... serves through stage servers
+holding the backbone's layers (kev.pipeline / `python -m kev.stage`): this process then keeps the tokenizer and the pointer
+head only, loads no weights and probes no device.
 """
 import argparse, asyncio, atexit, hmac, os, queue, random, sys, threading, time, traceback, uuid
 from concurrent.futures import Future
@@ -306,6 +308,7 @@ def models():
             "run": ck.requested, "base": meta.base, "lora": meta.lora, "device": s.device, "backend": s.model.backend, "dtype": s.model.dtype,
             "temperature": s.model.head.temperature, "max_state_tokens": SERVE_MAX_STATE, "truncate_states": s.truncate_states,
             "cuda_graphs": graphs.stats() if (graphs := getattr(s.model, "graphs", None)) else None,
+            "stages": s.model.stages_info() if s.model.backend == "pipeline" else None,   # kev.pipeline: the hosts holding the layers
             "prefix_cache": {"size": s.prefix_cache.size, "min_state_tokens": s.prefix_cache.min_tokens, "max_tokens": s.prefix_cache.max_tokens, "hits": s.prefix_cache.hits,
                              "misses": s.prefix_cache.misses, "cached_states": len(s.prefix_cache.entries), "oom_retries": s.prefix_cache.oom_retries},
             "batches": {"count": s.batches, "requests": s.batched_requests, "queued": s.queue.qsize()}}
@@ -337,6 +340,14 @@ def main():
     run = a.run if is_hub_id(a.run) or os.path.exists(f"{a.run}/head.pt") else a.fallback
     if run != a.run: print(f"{a.run} not found, falling back to {run}")
     opts = LoadOptions.from_env()
+    if opts.stages:   # KEV_STAGES: the backbone runs on stage servers (kev.pipeline); this process keeps the tokenizer and the head, so no probe, no weights
+        ck = Checkpoint(run, weights=False)
+        tok, model = ck.load("cpu" if a.device == "auto" else a.device, opts)
+        app.state.server = Server(ck, tok, model, model.device)
+        print(f"serving {ck.requested} through {len(model.stages)} stages " + ", ".join(f"{i['url']} layers {i['layers'][0]}:{i['layers'][1]} ({i['device']}, {i['dtype']})" for i in model.stages_info())
+              + f"; head on {model.device}; {a.host}:{a.port}")
+        import uvicorn
+        return uvicorn.run(app, host=a.host, port=a.port)
     if opts.backend is None: opts = replace(opts, backend="auto")   # serving default: MLX for the hybrid Qwen3.5 checkpoints on Apple Silicon (LoadOptions.backend); KEV_BACKEND=torch to decline
     dev, ck = _serving_device(a.device, opts, run)
     if dev == "mps" and opts.attn is None: opts = replace(opts, attn="sdpa")   # serving default on Apple GPUs (parity measured)

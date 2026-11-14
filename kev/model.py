@@ -202,6 +202,25 @@ def rows_of(enc):
     return enc["ids"][:Ls], enc["pos"][:Ls], rows
 
 
+def replicate_cache(cache, n, device):
+    """A cache (one state, batch 1) copied so that `n` rows may continue from it at once: every layer's tensors gathered n
+    times along the batch (reorder_cache with index 0), the layer objects copied first so the caller's prefix is never
+    written (DecisionModel._rows_hidden; kev.stage does the same for the layers a pipeline stage holds). Layers a cache
+    never filled stay as they are."""
+    replica = copy.copy(cache)
+    replica.layers = [copy.copy(layer) for layer in cache.layers]
+    for source, target in zip(cache.layers, replica.layers):
+        if isinstance(source, LinearAttentionCacheLayerMixin):
+            target.conv_states = source.conv_states.copy()
+            target.recurrent_states = source.recurrent_states.copy()
+            target.is_conv_states_initialized = source.is_conv_states_initialized.copy()
+            target.is_recurrent_states_initialized = source.is_recurrent_states_initialized.copy()
+            target.has_previous_state = source.has_previous_state.copy()
+            target.conv_kernel_size = source.conv_kernel_size.copy()
+    replica.reorder_cache(torch.zeros(n, dtype=torch.long, device=device))
+    return replica
+
+
 class PointerHead(nn.Module):
     def __init__(self, d, dp=256):
         """dp = pointer dimension (head capacity knob)."""
@@ -344,19 +363,8 @@ class DecisionModel(nn.Module):
             ids, pos, att = self._pad_rows(part)
             past = {}
             if cache is not None:
-                replica = copy.copy(cache)
-                replica.layers = [copy.copy(layer) for layer in cache.layers]
-                for source, target in zip(cache.layers, replica.layers):
-                    if isinstance(source, LinearAttentionCacheLayerMixin):
-                        target.conv_states = source.conv_states.copy()
-                        target.recurrent_states = source.recurrent_states.copy()
-                        target.is_conv_states_initialized = source.is_conv_states_initialized.copy()
-                        target.is_recurrent_states_initialized = source.is_recurrent_states_initialized.copy()
-                        target.has_previous_state = source.has_previous_state.copy()
-                        target.conv_kernel_size = source.conv_kernel_size.copy()
-                replica.reorder_cache(torch.zeros(len(part), dtype=torch.long, device=self.device))
                 att = torch.cat([torch.ones((len(part), prefix_len), dtype=torch.long, device=self.device), att], 1)
-                past = {"past_key_values": replica, "use_cache": True}
+                past = {"past_key_values": replicate_cache(cache, len(part), self.device), "use_cache": True}
             h = self.lm(input_ids=ids, position_ids=pos, attention_mask=att, **past).last_hidden_state.float()
             out += [h[i, : len(row_ids)] for i, (row_ids, _) in enumerate(part)]
         return out
