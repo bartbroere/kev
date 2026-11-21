@@ -6,6 +6,8 @@ one-process DecisionModel the same checkpoint loads into: the row and packed for
 isolation, a merged LoRA adapter. No downloads, no network."""
 import json
 import struct
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -34,11 +36,12 @@ class Router:
     """An httpx-style client routing each stage URL to its in-process app."""
 
     def __init__(self, apps):
-        self.apps, self.clients = apps, {}
+        self.apps, self.clients, self.lock = apps, {}, threading.Lock()
 
     def request(self, method, url, **kw):
         base = url.split("/v1")[0]
-        if base not in self.clients: self.clients[base] = TestClient(self.apps[base]).__enter__()
+        with self.lock:   # the coordinator sends passes from several threads
+            if base not in self.clients: self.clients[base] = TestClient(self.apps[base]).__enter__()
         return self.clients[base].request(method, url.replace(base, ""), **kw)
 
     def close(self):
@@ -56,7 +59,7 @@ def full_checkpoint(base_dir, out, dtype=torch.bfloat16, option_isolation=False,
     return Checkpoint(out)
 
 
-def staged(ck, cuts, dtype=torch.float32, key=None, lora_scale=1.0):
+def staged(ck, cuts, dtype=torch.float32, key=None, lora_scale=1.0, inflight=None):
     """-> (PipelineDecisionModel over in-process stages cut at `cuts`, the Stage objects). Loaded as Checkpoint.load
     would through LoadOptions.stages, but with the in-process client."""
     stages = [load_stage(ck, lo, hi, "cpu", dtype=dtype, lora_scale=lora_scale, log=lambda *a: None) for lo, hi in cuts]
@@ -64,7 +67,7 @@ def staged(ck, cuts, dtype=torch.float32, key=None, lora_scale=1.0):
     router = Router(apps)
     clients = connect(list(apps), ck.text_config(), ck.fingerprint(), key=key, client=router, lora_scale=lora_scale)
     tok = AutoTokenizer.from_pretrained(ck.meta.base)
-    model = PipelineDecisionModel(clients, ck.text_config(), tok.pad_token_id, "cpu", head_dim=ck.meta.head_dim, option_isolation=ck.meta.option_isolation)
+    model = PipelineDecisionModel(clients, ck.text_config(), tok.pad_token_id, "cpu", head_dim=ck.meta.head_dim, option_isolation=ck.meta.option_isolation, inflight=inflight)
     model.head.load_state_dict(ck.meta.head); model.eval(); model.head.temperature = ck.meta.temperature
     return tok, model, stages
 
@@ -321,3 +324,62 @@ def test_stage_fetches_only_the_shards_its_layers_need(tiny_base, tmp_path, monk
     with pytest.raises(ValueError, match="hold no"): fetch_shards(str(repo), {"layers.9.mlp.up_proj.weight"})
     # kev.checkpoint.resolve_run(weights=False) fetched the metadata only
     assert calls[0][2] == sorted(["*.json", "*.pt", "*.txt", "*.jinja"])
+
+
+def test_passes_overlap_across_stages_and_answers_stay_the_same(tiny_base, tmp_path):
+    """kev.serve's batch call with passes in flight: stage 0 runs one request while stage 1 runs another (each stage pass
+    slowed so the overlap is measurable), and every answer and kept state is the serial pipeline's. One request with
+    many questions overlaps too: its question chunks run concurrently on its cached state."""
+    ck = full_checkpoint(tiny_base / "base", tmp_path / "full")
+    tok, ref = ck.load("cpu", LoadOptions(dtype=torch.float32))
+    _, serial, _ = staged(ck, [(0, 1), (1, 2)], inflight=1)
+    _, pipe, stages = staged(ck, [(0, 1), (1, 2)])
+    assert serial.inflight == 1 and pipe.inflight == 2 and pipe.cache_slots == stage_module.STAGE_CACHES
+    spans = {0: [], 1: []}
+    for k, st in enumerate(stages):   # one layer per stage: the hook runs once per pass, inside the stage's lock
+        def slow(module, args, output, k=k):
+            t = time.perf_counter(); time.sleep(0.05); spans[k].append((t, time.perf_counter()))
+        st.lm.layers[0].register_forward_hook(slow)
+    encs = [ref.encode(tok, request(s)) for s in ("it it", "the customer is angry", "charged twice", "it is the customer")]
+    hit = pipe.probs_and_prefix(encs[0])[1]
+    hit_serial = serial.probs_and_prefix(encs[0])[1]
+    for st in spans.values(): st.clear()
+    keep = [False, True, False, False]
+    got, kept = pipe.probs_batch(encs, [hit, None, None, None], keep)
+    want, want_kept = serial.probs_batch(encs, [hit_serial, None, None, None], keep)
+    for g, w, e in zip(got, want, encs):
+        assert close_to(g, w, 1e-6) and close_to(g, ref.probs(e))
+    assert [k is None for k in kept] == [False, False, True, True] and kept[0] is hit and kept[1][1].id in stages[1].caches
+    assert close_to(pipe.probs_with_prefix(encs[1], kept[1]), want[1])
+    overlap = lambda a, b: a[0] < b[1] and b[0] < a[1]
+    assert any(overlap(a, b) for a in spans[0] for b in spans[1]), "stage 0 and stage 1 never ran at the same time"
+
+    # one request, many questions: the chunks after the state run concurrently (rows_per_pass of 1 forces one row per pass)
+    many = {"state": "the customer is charged twice", "model": "kev-latest",
+            "questions": {f"q{i}": {"type": "noul", "instructions": f"is it {i}"} for i in range(6)}}
+    enc = ref.encode(tok, to_record(SystemOneRequest(**many))[0])
+    import kev.pipeline as kp
+    rows_per_pass, kp.rows_per_pass = kp.rows_per_pass, lambda rows, cached=0: 1
+    try:
+        for st in spans.values(): st.clear()
+        probs, prefix = pipe.probs_and_prefix(enc)
+    finally:
+        kp.rows_per_pass = rows_per_pass
+    assert close_to(probs, ref.probs(enc)) and len(spans[0]) == 7   # the state, then six question passes
+    assert any(overlap(a, b) for a in spans[0][1:] for b in spans[1][1:])
+    serial.close(); pipe.close()
+
+
+def test_request_width_leaves_the_stage_caches_room():
+    """A batch runs as many requests at once as `inflight` allows, unless the requests that hold a state of their own
+    while they run would not fit the stage cache slots left (two each: a released state leaves with a later pass)."""
+    enc = {"ids": [1] * 4, "seg": [0, 0, 1, 1]}
+    m = PipelineDecisionModel.__new__(PipelineDecisionModel)
+    m.inflight, m.cache_slots, m.live, m.hybrid = 4, 16, 0, True
+    assert m.request_width([enc] * 8, [None] * 8, [False] * 8) == 4
+    m.live = 10
+    assert m.request_width([enc] * 8, [None] * 8, [True, True] + [False] * 6) == 2   # (16 - 10 - 2) // 2
+    m.live = 15
+    assert m.request_width([enc] * 8, [None] * 8, [False] * 8) == 1                  # never below one: the serial pipeline
+    assert m.request_width([enc] * 8, [("hit",)] * 8, [False] * 8) == 4              # hits hold no state of their own
+    assert m.request_width([enc] * 2, [None] * 2, [False] * 2) == 1

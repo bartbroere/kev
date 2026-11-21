@@ -129,6 +129,7 @@ class LoadOptions:
                  implementation and (on a LoRA checkpoint) always merge the adapter, so dtype / merge / attn / cuda_graphs /
                  fused do not apply; lora_scale does (each stage scales its own merge). stage_key: the bearer key the stage
                  servers were started with (KEV_STAGE_KEY), if any.
+                 stage_inflight: passes in flight at once (KEV_STAGE_INFLIGHT; 0 = one per stage, 1 = serial).
     """
     dtype: torch.dtype | None = None
     merge: bool = True
@@ -140,6 +141,7 @@ class LoadOptions:
     fused: bool | None = None
     stages: tuple = ()
     stage_key: str | None = None
+    stage_inflight: int = 0
 
     BACKENDS = (None, "torch", "mlx", "auto")
 
@@ -159,7 +161,7 @@ class LoadOptions:
                    cuda_graphs={"0": False, "1": True}.get(env.get("KEV_CUDA_GRAPHS", "")),
                    fused={"0": False, "1": True}.get(env.get("KEV_FUSED", "")),
                    stages=tuple(s.strip() for s in env.get("KEV_STAGES", "").split(",") if s.strip()),
-                   stage_key=env.get("KEV_STAGE_KEY") or None)
+                   stage_key=env.get("KEV_STAGE_KEY") or None, stage_inflight=int(env.get("KEV_STAGE_INFLIGHT") or 0))
 
 
 def mlx_available():
@@ -280,7 +282,8 @@ class Checkpoint:
         if self.meta.special_embeddings: raise ValueError("a pipeline does not carry trained token embeddings (special_embeddings checkpoints); use one host")
         config = self.text_config()
         stages = connect(opts.stages, config, self.fingerprint(), key=opts.stage_key, lora_scale=opts.lora_scale)
-        return PipelineDecisionModel(stages, config, pad_id(tok), device, head_dim=self.meta.head_dim, option_isolation=self.meta.option_isolation)
+        return PipelineDecisionModel(stages, config, pad_id(tok), device, head_dim=self.meta.head_dim, option_isolation=self.meta.option_isolation,
+                                     inflight=opts.stage_inflight)
 
     def fingerprint(self):
         """What identifies this checkpoint to a pipeline without its weight files: head.pt's sha256 (the pointer head, the

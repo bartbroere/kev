@@ -345,7 +345,7 @@ Title Case sections, API tables, Authors + License); model cards are formal.
     prefix tuple kev.serve's PrefixCache holds) and, on each stage, a DynamicCache of its own layers; a pass continuing it runs on a `replicate_cache` copy;
     a dropped handle's id is released on the stages with the next pass (`weakref.finalize`), and a stage keeps at most `KEV_STAGE_CACHES` (16) states anyway
     (a pass naming a state it lost is a 409 -> `StageError`). `KEV_STAGE_KEY` is the stages' bearer key (hidden states of documents cross the network:
-    private network or TLS). Not faster than one host that fits the model (2 x stages hops per pass, stages run in turn); no fused kernels or CUDA
+    private network or TLS). Passes overlap: the coordinator keeps `KEV_STAGE_INFLIGHT` passes in flight (`LoadOptions.stage_inflight`, default one per stage, 1 = serial; a batch's requests concurrently, at most half the stage cache slots left free, and a request's question chunks once its state is cached), so throughput grows with balanced stages while one request's latency does not. Not faster than one host that fits the model (2 x stages hops per pass); no fused kernels or CUDA
     graphs on a stage; `forward` is the prefix form (state once), as on MLX. `/v1/models` lists the stages; `kernel_environment` records them.
 - Extra endpoints for the demo: `POST /v1/systemone/permute` (one Choice under n option orders), `POST /v1/systemone/separate`
   (each question alone; packed-vs-separate comparison). `/v1/systemone` also returns `latency_ms`.
